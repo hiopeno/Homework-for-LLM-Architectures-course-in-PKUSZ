@@ -24,15 +24,40 @@ def main():
     x_train, y_train = d["x_train"], d["y_train"]
     x_val, y_val = d["x_test"], d["y_test"]  # use as dev set
 
+    lr=args.lr
     model = build_model(seed=0)
     rows = []
+    rng = np.random.default_rng(0)
     for epoch in range(args.epochs):
         # TODO: shuffle; loop over mini-batches:
-        #   logits = model.forward(xb)
-        #   loss   = model.loss_fn.forward(logits, yb)
-        #   dlogits = model.loss_fn.backward()
-        #   backprop through layers; SGD update W -= lr * dW, b -= lr * db
-        train_loss = 0.0  # TODO: epoch mean loss
+        indices = rng.permutation(len(x_train))  # 打乱样本下标
+        epoch_loss_sum = 0.0
+
+        for start in range(0, len(x_train), args.batch):
+            batch_indices = indices[start:start + args.batch]
+            xb = x_train[batch_indices]
+            yb = y_train[batch_indices]
+
+            # 前向传播与损失
+            logits = model.forward(xb)
+            loss   = model.loss_fn.forward(logits, yb)
+
+            # 反向传播
+            dlogits = model.loss_fn.backward()
+            d_hidden = model.linear2.backward(dlogits)
+            d_hidden = model.relu.backward(d_hidden)
+            model.linear1.backward(d_hidden)
+
+            # SGD update  W -= lr * dW, b -= lr * db
+            model.linear1.W-=lr*model.linear1.dW
+            model.linear1.b-=lr*model.linear1.db
+
+            model.linear2.W-=lr*model.linear2.dW
+            model.linear2.b-=lr*model.linear2.db
+         
+            # loss 是这个 batch 的平均损失，乘回样本数后累计
+            epoch_loss_sum += loss * len(xb)
+        train_loss = epoch_loss_sum / len(x_train)# TODO: epoch mean loss
         val_acc = float((model.predict(x_val) == y_val).mean())
         rows.append({"epoch": epoch, "train_loss": train_loss, "val_acc": val_acc})
         print(f"epoch {epoch}  loss {train_loss:.4f}  val_acc {val_acc:.4f}")
