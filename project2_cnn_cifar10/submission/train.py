@@ -23,9 +23,15 @@ RESULT_FIELDS = ("run_name", "test_acc", "params", "train_minutes")
 def make_transforms(run_name):
     """Return train/test transforms; no_aug must disable all augmentation."""
     test_transform = transforms.ToTensor()
-    # TODO: for baseline/no_bn/lr_10x, add RandomCrop and RandomHorizontalFlip.
-    # TODO: for no_aug, use only ToTensor().
-    raise NotImplementedError
+    if run_name == "no_aug":
+        train_transform = transforms.ToTensor()
+    else:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+    return train_transform, test_transform
 
 
 @torch.no_grad()
@@ -77,7 +83,13 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    if args.epochs < 10:
+        parser.error("--epochs must be at least 10 so each log has at least 10 rows")
+    if args.batch_size <= 0 or args.workers < 0 or args.lr <= 0:
+        parser.error("--batch-size and --lr must be positive; --workers cannot be negative")
+
     torch.manual_seed(0)
+    device = torch.device(args.device)
     train_transform, test_transform = make_transforms(args.run)
     train_set = torchvision.datasets.CIFAR10(
         args.data_root, train=True, download=True, transform=train_transform
@@ -87,21 +99,25 @@ def main():
     )
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=args.device.startswith("cuda"),
+        num_workers=args.workers, pin_memory=(device.type == "cuda"),
     )
     test_loader = torch.utils.data.DataLoader(
         test_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=args.device.startswith("cuda"),
+        num_workers=args.workers, pin_memory=(device.type == "cuda"),
     )
 
     model_variant = "no_bn" if args.run == "no_bn" else "baseline"
-    model = build_model(model_variant).to(args.device)
+    model = build_model(model_variant).to(device)
     base_lr = args.lr * (10.0 if args.run == "lr_10x" else 1.0)
 
-    # TODO: create CrossEntropyLoss, SGD optimizer and a learning-rate scheduler.
-    criterion = None
-    optimizer = None
-    scheduler = None
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=base_lr, momentum=0.9, weight_decay=5e-4,
+        nesterov=True,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=base_lr * 0.01,
+    )
 
     rows = []
     started = time.perf_counter()
@@ -110,13 +126,18 @@ def main():
         loss_sum = 0.0
         seen = 0
         for images, labels in train_loader:
-            images = images.to(args.device, non_blocking=True)
-            labels = labels.to(args.device, non_blocking=True)
-            # TODO: zero gradients, forward, compute loss, backward and step.
-            raise NotImplementedError
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item() * labels.size(0)
+            seen += labels.size(0)
 
-        # TODO: step the scheduler once per epoch.
-        val_acc = evaluate(model, test_loader, args.device)
+        scheduler.step()
+        val_acc = evaluate(model, test_loader, device)
         rows.append({
             "epoch": epoch,
             "train_loss": loss_sum / seen,
@@ -124,13 +145,16 @@ def main():
         })
         out_dir = Path(args.out_dir)
         write_log(out_dir / "logs" / f"{args.run}.csv", rows)
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"{args.run} epoch={epoch:03d} "
-            f"loss={rows[-1]['train_loss']:.4f} val_acc={val_acc:.4f}",
+            f"loss={rows[-1]['train_loss']:.4f} val_acc={val_acc:.4f} "
+            f"lr={current_lr:.6g}",
             flush=True,
         )
 
     out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     if args.run == "baseline":
         torch.save(model.state_dict(), out_dir / "weights.pt")
     minutes = (time.perf_counter() - started) / 60.0
